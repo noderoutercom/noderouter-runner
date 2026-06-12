@@ -31,10 +31,13 @@ import signal
 import sys
 import threading
 import time
+import tempfile
+import uuid
 import zipfile
 
 import asyncpg
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 import websockets
 from dotenv import load_dotenv
 
@@ -49,7 +52,25 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CORE_WS_URL       = os.getenv("CORE_WS_URL", "ws://localhost:3000")
+def _resolve_core_ws_url() -> str:
+    ws_url = os.getenv("CORE_WS_URL", "").strip()
+    if ws_url:
+        return ws_url
+
+    core_url = os.getenv("CORE_URL", "").strip()
+    if core_url:
+        if core_url.startswith("http://"):
+            return "ws://" + core_url[7:]
+        if core_url.startswith("https://"):
+            return "wss://" + core_url[8:]
+        if core_url.startswith("ws://") or core_url.startswith("wss://"):
+            return core_url
+        return core_url
+
+    return "ws://localhost:3000"
+
+
+CORE_WS_URL       = _resolve_core_ws_url()
 NODE_ID           = os.getenv("NODE_ID", "")
 RUNNER_SECRET     = os.getenv("RUNNER_SECRET", "")
 APPS_DIR          = os.getenv(
@@ -76,10 +97,12 @@ _thread_pool:  concurrent.futures.ThreadPoolExecutor  | None = None
 
 # ── DB Pool (asyncpg) ─────────────────────────────────────────────────────────
 _db_pool: asyncpg.Pool | None = None
+_sync_db_pool: ThreadedConnectionPool | None = None
 
 # ── App Registry ───────────────────────────────────────────────────────────────
 _app_registry: dict = {}
 _registry_lock = threading.Lock()   # sync lock — held only during writes in _load_app
+_import_lock = threading.Lock()      # protects temporary sys.path mutation during app imports
 _conn_capable:  dict[int, bool] = {}
 
 # ── Sync concurrency control (B9, B12) ────────────────────────────────────────
@@ -131,6 +154,36 @@ def _resolve_app_path(app_name: str) -> str | None:
         os.path.join(APPS_DIR, f"{app_name}.py"),
     ]
     return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+@contextlib.contextmanager
+def _app_import_context(app_path: str):
+    """
+    Temporarily prepend an app's directory and optional libs/ directory to sys.path.
+
+    This lets app-local imports resolve during module load without permanently
+    mutating the interpreter's import path.
+    """
+    app_dir = os.path.realpath(os.path.dirname(app_path))
+    libs_dir = os.path.join(app_dir, "libs")
+    import_paths = []
+    if os.path.isdir(libs_dir):
+        import_paths.append(libs_dir)
+    if app_dir not in import_paths:
+        import_paths.append(app_dir)
+
+    with _import_lock:
+        inserted: list[str] = []
+        try:
+            for path in reversed(import_paths):
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+                    inserted.append(path)
+            yield
+        finally:
+            for path in inserted:
+                with contextlib.suppress(ValueError):
+                    sys.path.remove(path)
 
 
 # ── Node ID resolution ─────────────────────────────────────────────────────────
@@ -334,7 +387,7 @@ _MAX_EXTRACT_FILE_BYTES  = 50 * 1024 * 1024   # 50 MB per-file cap
 _MAX_EXTRACT_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB aggregate cap
 
 
-def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> None:
+def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> str:
     """
     Safely extract a ZIP bundle (raw bytes) into APPS_DIR/{app_name}/.
 
@@ -346,8 +399,7 @@ def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> None:
     - Aggregate decompression cap (_MAX_EXTRACT_TOTAL_BYTES): guards against
       zip-bomb payloads composed of many individually-small members.
 
-    Uses an atomic rename (tmp → target) so concurrent readers never observe
-    a partially extracted directory.
+    Returns the staged version directory path on success.
     """
     if err := _validate_app_name(app_name):
         raise ValueError(err)
@@ -355,14 +407,7 @@ def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> None:
     abs_apps_dir = os.path.realpath(APPS_DIR)
     os.makedirs(abs_apps_dir, exist_ok=True)
 
-    target_dir = os.path.join(abs_apps_dir, app_name)
-    tmp_dir    = os.path.join(abs_apps_dir, f"tmp_{app_name}_{os.getpid()}")
-
-    # Clean up a stale tmp dir from a prior failed run, if any.
-    if os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    os.makedirs(tmp_dir, mode=0o755)
+    tmp_dir = tempfile.mkdtemp(prefix=f"tmp_{app_name}_", dir=abs_apps_dir)
     total_written = 0
 
     try:
@@ -413,16 +458,74 @@ def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> None:
                 "[DEPLOY] Invalid bundle: main.py is required at the bundle root"
             )
 
-        # Atomic promotion: evict stale dir, rename tmp into place.
-        if os.path.exists(target_dir):
-            shutil.rmtree(target_dir)
-        os.rename(tmp_dir, target_dir)
-        log.info("[DEPLOY] Extracted app '%s' → %s", app_name, target_dir)
+        version_root = os.path.join(abs_apps_dir, ".versions", app_name)
+        os.makedirs(version_root, mode=0o755, exist_ok=True)
+        version_dir = os.path.join(
+            version_root,
+            f"{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex}",
+        )
+        os.rename(tmp_dir, version_dir)
+        log.info("[DEPLOY] Staged app '%s' → %s", app_name, version_dir)
+        return version_dir
 
     except Exception:
         # Always clean up the temp directory on failure.
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
+
+
+def _activate_app_version(app_name: str, version_dir: str) -> str | None:
+    """
+    Make version_dir the active app path.
+
+    On POSIX, the active app path becomes a symlink so later reloads can swap
+    it atomically. On Windows, fall back to a directory rename.
+
+    Returns the previous active target when one existed.
+    """
+    abs_apps_dir = os.path.realpath(APPS_DIR)
+    active_path = os.path.join(abs_apps_dir, app_name)
+    version_dir = os.path.realpath(version_dir)
+    previous_target = None
+
+    if _IS_WINDOWS:
+        if os.path.lexists(active_path):
+            if os.path.isdir(active_path):
+                previous_target = os.path.join(
+                    abs_apps_dir,
+                    ".versions",
+                    app_name,
+                    f"legacy_{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex}",
+                )
+                os.makedirs(os.path.dirname(previous_target), exist_ok=True)
+                os.rename(active_path, previous_target)
+            elif os.path.isfile(active_path):
+                previous_target = active_path
+                os.unlink(active_path)
+        os.rename(version_dir, active_path)
+        return previous_target
+
+    if os.path.islink(active_path):
+        previous_target = os.path.realpath(active_path)
+        temp_link = f"{active_path}.link.{os.getpid()}.{uuid.uuid4().hex}"
+        os.symlink(version_dir, temp_link)
+        os.replace(temp_link, active_path)
+        return previous_target
+
+    if os.path.lexists(active_path):
+        previous_target = os.path.join(
+            abs_apps_dir,
+            ".versions",
+            app_name,
+            f"legacy_{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex}",
+        )
+        os.makedirs(os.path.dirname(previous_target), exist_ok=True)
+        os.rename(active_path, previous_target)
+
+    temp_link = f"{active_path}.link.{os.getpid()}.{uuid.uuid4().hex}"
+    os.symlink(version_dir, temp_link)
+    os.replace(temp_link, active_path)
+    return previous_target
 
 
 def _fetch_app_bytes_sync(app_name: str) -> bytes | None:
@@ -449,7 +552,7 @@ def _fetch_app_bytes_sync(app_name: str) -> bytes | None:
         return None
 
 
-def _load_app(app_name: str):
+def _load_app(app_name: str, app_path: str | None = None):
     """
     Dynamically load an app module from disk and atomically update the registry.
     Safe to call from thread pool workers (uses threading.Lock).
@@ -459,14 +562,18 @@ def _load_app(app_name: str):
     if err := _validate_app_name(app_name):
         return None, err
 
-    app_path = _resolve_app_path(app_name)
+    if app_path is None:
+        app_path = _resolve_app_path(app_name)
     if app_path is None:
         return None, f"app '{app_name}' not found in {APPS_DIR}"
 
     try:
-        spec   = importlib.util.spec_from_file_location(f"app_{app_name}", app_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        with _app_import_context(app_path):
+            spec = importlib.util.spec_from_file_location(f"app_{app_name}", app_path)
+            if spec is None or spec.loader is None:
+                return None, f"failed to create import spec for app '{app_name}'"
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
     except Exception as exc:
         return None, f"failed to load app '{app_name}': {exc}"
 
@@ -523,11 +630,22 @@ def _preload_apps() -> None:
                     log.warning("[DEPLOY] Preload skipped DB app '%s': %s", app_name, err)
                     continue
                 try:
-                    _extract_zip_to_apps(app_name, bytes(code_bytes_raw))
-                    _, load_err = _load_app(app_name)
+                    version_dir = _extract_zip_to_apps(app_name, bytes(code_bytes_raw))
+                    version_main = os.path.join(version_dir, "main.py")
+                    _, load_err = _load_app(app_name, version_main)
                     if load_err:
                         log.warning("[DEPLOY] Preload load error '%s': %s", app_name, load_err)
+                        shutil.rmtree(version_dir, ignore_errors=True)
                     else:
+                        previous_target = None
+                        try:
+                            previous_target = _activate_app_version(app_name, version_dir)
+                        except Exception as exc:
+                            log.warning("[DEPLOY] Preload activation error '%s': %s", app_name, exc)
+                            shutil.rmtree(version_dir, ignore_errors=True)
+                            continue
+                        if previous_target and os.path.exists(previous_target):
+                            shutil.rmtree(previous_target, ignore_errors=True)
                         loaded += 1
                 except Exception as exc:
                     log.warning("[DEPLOY] Preload extraction error '%s': %s", app_name, exc)
@@ -563,10 +681,29 @@ def _execute_app_isolated(app_path: str, data: dict) -> dict:
     and native extension faults. Uses short-lived psycopg2 connections for any
     DB writes per the Direct DB Write Architecture.
     """
-    spec   = importlib.util.spec_from_file_location("app_isolated", app_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with _app_import_context(app_path):
+        spec = importlib.util.spec_from_file_location("app_isolated", app_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to create import spec for {app_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
     return module.execute(data)
+
+
+def _run_sync_execute(module, payload: dict):
+    """Execute a sync app, injecting a pooled connection when supported."""
+    fn = getattr(module, "execute")
+
+    if _sync_db_pool is None or not _conn_capable.get(id(module), False):
+        return fn(payload)
+
+    conn = _sync_db_pool.getconn()
+    try:
+        with conn:
+            return fn(payload, conn=conn)
+    finally:
+        with contextlib.suppress(Exception):
+            _sync_db_pool.putconn(conn)
 
 
 # ── DB helpers (async, asyncpg) ────────────────────────────────────────────────
@@ -770,7 +907,7 @@ async def _dispatch_execute(module, payload: dict):
     if asyncio.iscoroutinefunction(fn):
         return await fn(payload)
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_thread_pool, fn, payload)
+    return await loop.run_in_executor(_thread_pool, _run_sync_execute, module, payload)
 
 
 # ── Sync request handler (tunnel req frame) ────────────────────────────────────
@@ -809,74 +946,78 @@ async def _handle_req(ws, msg: dict) -> None:
         except Exception as exc:
             log.debug("Tunnel send failed rid=%s: %s", rid, exc)
 
-    # B9: acquire semaphore BEFORE processing to bound the number of in-flight
-    # tasks.  Allows SYNC_MAX_WORKERS × 4 concurrent handlers; excess tasks wait
-    # here rather than spawning unboundedly and exhausting system resources.
-    async with _sync_semaphore:
-        if err := _validate_app_name(app_name):
-            await _send_res(400, {"error": err})
-            return
+    if err := _validate_app_name(app_name):
+        await _send_res(400, {"error": err})
+        return
 
-        # B8: lock-free registry read (GIL-safe).
-        module = _get_app(app_name)
-        if module is None:
-            # B12: coalesce concurrent misses for the same app_name.
-            # Only the first coroutine through the app_lock calls _load_app;
-            # others wait, then re-check the registry before re-loading.
-            async with _app_load_locks_mu:
-                if app_name not in _app_load_locks:
-                    _app_load_locks[app_name] = asyncio.Lock()
-                app_lock = _app_load_locks[app_name]
+    # B8: lock-free registry read (GIL-safe).
+    module = _get_app(app_name)
+    if module is None:
+        # B12: coalesce concurrent misses for the same app_name.
+        # Only the first coroutine through the app_lock calls _load_app;
+        # others wait, then re-check the registry before re-loading.
+        async with _app_load_locks_mu:
+            if app_name not in _app_load_locks:
+                _app_load_locks[app_name] = asyncio.Lock()
+            app_lock = _app_load_locks[app_name]
 
-            async with app_lock:
-                module = _get_app(app_name)  # re-check: another coroutine may have loaded it
-                if module is None:
-                    module, load_err = await asyncio.to_thread(_load_app, app_name)
-                    if load_err:
-                        await _send_res(404, {"error": load_err})
-                        return
+        async with app_lock:
+            module = _get_app(app_name)  # re-check: another coroutine may have loaded it
+            if module is None:
+                module, load_err = await asyncio.to_thread(_load_app, app_name)
+                if load_err:
+                    await _send_res(404, {"error": load_err})
+                    return
 
-        try:
-            if isinstance(payload, (str, bytes)):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = {}
+    try:
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
 
-            # B10: sync apps → thread pool; async apps → event loop directly.
-            result = await _dispatch_execute(module, payload)
+        # B10: sync apps → thread pool; async apps → event loop directly.
+        result = await _dispatch_execute(module, payload)
 
-            # Strip _actions before serialising the response.
-            actions_to_dispatch = []
-            if isinstance(result, dict) and "_actions" in result:
-                raw = result.pop("_actions")
-                if isinstance(raw, list):
-                    actions_to_dispatch = raw
+        # Strip _actions before serialising the response.
+        actions_to_dispatch = []
+        if isinstance(result, dict) and "_actions" in result:
+            raw = result.pop("_actions")
+            if isinstance(raw, list):
+                actions_to_dispatch = raw
 
-            await _send_res(200, result if isinstance(result, dict) else {"result": result})
+        await _send_res(200, result if isinstance(result, dict) else {"result": result})
 
-            # Send action frames to Core after the response is delivered so the
-            # calling client is unblocked before we fire notifications.
-            for act in actions_to_dispatch:
-                if not isinstance(act, dict) or not act.get("name"):
-                    continue
-                try:
-                    frame = json.dumps({
-                        "type":        "action",
-                        "app_name":    app_name,
-                        "action_name": act["name"],
-                        "payload":     act.get("payload"),
-                    })
-                    await ws.send(frame)
-                    log.debug("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
-                except Exception as exc:
-                    log.debug(
-                        "[action] Frame send failed app=%s action=%s: %s",
-                        app_name, act.get("name"), exc,
-                    )
-        except Exception as exc:
-            log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
-            await _send_res(500, {"error": str(exc)})
+        # Send action frames to Core after the response is delivered so the
+        # calling client is unblocked before we fire notifications.
+        for act in actions_to_dispatch:
+            if not isinstance(act, dict) or not act.get("name"):
+                continue
+            try:
+                frame = json.dumps({
+                    "type":        "action",
+                    "app_name":    app_name,
+                    "action_name": act["name"],
+                    "payload":     act.get("payload"),
+                })
+                await ws.send(frame)
+                log.debug("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
+            except Exception as exc:
+                log.debug(
+                    "[action] Frame send failed app=%s action=%s: %s",
+                    app_name, act.get("name"), exc,
+                )
+    except Exception as exc:
+        log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
+        await _send_res(500, {"error": str(exc)})
+
+
+async def _handle_req_with_permit(ws, msg: dict) -> None:
+    try:
+        await _handle_req(ws, msg)
+    finally:
+        if _sync_semaphore is not None:
+            _sync_semaphore.release()
 
 
 # ── WebSocket Tunnel Loop ──────────────────────────────────────────────────────
@@ -917,7 +1058,15 @@ async def _tunnel_loop() -> None:
                     elif t == "ping":
                         await ws.send(json.dumps({"type": "pong"}))
                     elif t == "req":
-                        asyncio.create_task(_handle_req(ws, msg))
+                        if _sync_semaphore is None:
+                            asyncio.create_task(_handle_req(ws, msg))
+                            continue
+                        await _sync_semaphore.acquire()
+                        try:
+                            asyncio.create_task(_handle_req_with_permit(ws, msg))
+                        except Exception:
+                            _sync_semaphore.release()
+                            raise
 
         except asyncio.CancelledError:
             return
@@ -997,15 +1146,28 @@ async def _pull_and_reload_app(app_name: str) -> None:
         )
 
         # Extraction is CPU/IO-bound; offload to the thread pool.
-        await asyncio.to_thread(_extract_zip_to_apps, app_name, zip_bytes)
+        version_dir = await asyncio.to_thread(_extract_zip_to_apps, app_name, zip_bytes)
 
-        # Hot-reload the Python module into the in-memory registry.
-        _, load_err = await asyncio.to_thread(_load_app, app_name)
+        version_main = os.path.join(version_dir, "main.py")
+
+        # Load the staged version first so a bad deploy never displaces the
+        # currently active app.
+        _, load_err = await asyncio.to_thread(_load_app, app_name, version_main)
         if load_err:
             log.warning(
                 "[DEPLOY] app_updated: load error for '%s': %s", app_name, load_err
             )
+            shutil.rmtree(version_dir, ignore_errors=True)
         else:
+            previous_target = None
+            try:
+                previous_target = await asyncio.to_thread(_activate_app_version, app_name, version_dir)
+            except Exception as exc:
+                log.warning("[DEPLOY] app_updated: activation error for '%s': %s", app_name, exc)
+                shutil.rmtree(version_dir, ignore_errors=True)
+                return
+            if previous_target and os.path.exists(previous_target):
+                shutil.rmtree(previous_target, ignore_errors=True)
             log.info(
                 "[DEPLOY] Extraction completed locally, broadcasting 'app_updated' "
                 "notification — app=%s hot-reloaded successfully", app_name,
@@ -1082,7 +1244,7 @@ async def _async_listener_loop() -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 async def main() -> None:
-    global _shutdown_event, _db_pool, _sync_semaphore, _app_load_locks_mu
+    global _shutdown_event, _db_pool, _sync_db_pool, _sync_semaphore, _app_load_locks_mu
     _shutdown_event = asyncio.Event()
 
     # B9: initialise semaphore now that the event loop is running.
@@ -1120,6 +1282,20 @@ async def main() -> None:
     await asyncio.to_thread(_preload_apps)
 
     if DATABASE_URL:
+        try:
+            _sync_db_pool = ThreadedConnectionPool(
+                2,
+                max(SYNC_MAX_WORKERS, ASYNC_MAX_WORKERS) + 4,
+                dsn=DATABASE_URL,
+            )
+            log.info(
+                "psycopg2 threaded pool initialized (min=2, max=%d)",
+                max(SYNC_MAX_WORKERS, ASYNC_MAX_WORKERS) + 4,
+            )
+        except Exception as exc:
+            _sync_db_pool = None
+            log.warning("psycopg2 threaded pool initialization failed: %s", exc)
+
         _db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
@@ -1138,6 +1314,9 @@ async def main() -> None:
 
     if _db_pool:
         await _db_pool.close()
+    if _sync_db_pool:
+        _sync_db_pool.closeall()
+        _sync_db_pool = None
     if _process_pool:
         _process_pool.shutdown(wait=False)
     if _thread_pool:
@@ -1161,6 +1340,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("Interrupted — exiting.")
     finally:
+        if _sync_db_pool:
+            _sync_db_pool.closeall()
         if _process_pool:
             _process_pool.shutdown(wait=False)
         if _thread_pool:
