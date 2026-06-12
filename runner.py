@@ -18,6 +18,7 @@ import contextlib
 from datetime import datetime, timezone
 import hashlib
 import hmac as hmac_lib
+import importlib.machinery
 import importlib.util
 import inspect
 import io
@@ -102,8 +103,16 @@ _sync_db_pool: ThreadedConnectionPool | None = None
 # ── App Registry ───────────────────────────────────────────────────────────────
 _app_registry: dict = {}
 _registry_lock = threading.Lock()   # sync lock — held only during writes in _load_app
-_import_lock = threading.Lock()      # protects temporary sys.path mutation during app imports
+_import_lock = threading.Lock()      # serialises app module imports in the daemon process
 _conn_capable:  dict[int, bool] = {}
+
+# ── Per-app module namespaces (F1/F2) ──────────────────────────────────────────
+# Each app loads under a unique synthetic package (see _import_app_module), so
+# sibling modules of different apps can never collide in sys.modules, and a
+# redeploy purges exactly the modules the old version registered.
+_app_active_pkg: dict[str, str] = {}          # app_name → current package name
+_path_refs: dict[str, int] = {}               # sys.path entry → in-flight user count
+_path_refs_lock = threading.Lock()
 
 # ── Sync concurrency control (B9, B12) ────────────────────────────────────────
 # asyncio objects must be created inside main() after the event loop is running.
@@ -159,10 +168,14 @@ def _resolve_app_path(app_name: str) -> str | None:
 @contextlib.contextmanager
 def _app_import_context(app_path: str):
     """
-    Temporarily prepend an app's directory and optional libs/ directory to sys.path.
+    Make an app's directory and optional libs/ directory importable while the
+    block runs — both during module load and across execute(), so lazy imports
+    inside app code resolve (F3).
 
-    This lets app-local imports resolve during module load without permanently
-    mutating the interpreter's import path.
+    Entries are reference-counted: overlapping executions of different apps —
+    or of the same app on several threads — each pin the paths they need, and
+    a path leaves sys.path only when its last user exits. The lock guards the
+    bookkeeping only and is never held across user code.
     """
     app_dir = os.path.realpath(os.path.dirname(app_path))
     libs_dir = os.path.join(app_dir, "libs")
@@ -172,18 +185,24 @@ def _app_import_context(app_path: str):
     if app_dir not in import_paths:
         import_paths.append(app_dir)
 
-    with _import_lock:
-        inserted: list[str] = []
-        try:
-            for path in reversed(import_paths):
-                if path not in sys.path:
-                    sys.path.insert(0, path)
-                    inserted.append(path)
-            yield
-        finally:
-            for path in inserted:
-                with contextlib.suppress(ValueError):
-                    sys.path.remove(path)
+    with _path_refs_lock:
+        # Reversed so import_paths[0] (libs/) lands first on sys.path.
+        for path in reversed(import_paths):
+            if _path_refs.get(path, 0) == 0 and path not in sys.path:
+                sys.path.insert(0, path)
+            _path_refs[path] = _path_refs.get(path, 0) + 1
+    try:
+        yield
+    finally:
+        with _path_refs_lock:
+            for path in import_paths:
+                remaining = _path_refs.get(path, 1) - 1
+                if remaining > 0:
+                    _path_refs[path] = remaining
+                else:
+                    _path_refs.pop(path, None)
+                    with contextlib.suppress(ValueError):
+                        sys.path.remove(path)
 
 
 # ── Node ID resolution ─────────────────────────────────────────────────────────
@@ -552,6 +571,99 @@ def _fetch_app_bytes_sync(app_name: str) -> bytes | None:
         return None
 
 
+def _purge_app_modules(app_name: str) -> None:
+    """
+    Drop an app's synthetic package namespace from sys.modules (F2).
+    Live references held by already-imported module objects keep working —
+    only the import cache is cleared.
+    """
+    pkg_name = _app_active_pkg.pop(app_name, None)
+    if pkg_name:
+        for key in [k for k in sys.modules if k == pkg_name or k.startswith(pkg_name + ".")]:
+            sys.modules.pop(key, None)
+
+
+def _module_origin(mod) -> str | None:
+    """Best-effort filesystem origin of a module (file or package dir)."""
+    origin = getattr(mod, "__file__", None)
+    if origin:
+        return origin
+    search = list(getattr(mod, "__path__", None) or [])
+    return search[0] if search else None
+
+
+def _import_app_module(app_name: str, app_path: str):
+    """
+    Import an app's main.py as `<pkg>.main` under a unique synthetic package
+    whose __path__ is the app directory (F1).
+
+    Sibling modules resolve via relative imports (`from . import utils`) into
+    the same namespace — `<pkg>.utils` — so two apps shipping a `utils.py`
+    can never collide in sys.modules. The package name embeds a fresh suffix
+    per load, so the previous version keeps its namespace until the new load
+    succeeds: a failed redeploy never breaks the still-active module.
+
+    Bare sibling imports (`import utils`) remain supported through the
+    sys.path context, but any module that resolved to a file inside the app
+    dir is evicted from sys.modules once the load completes — the main module
+    keeps its live reference, while the next app (or the next version of this
+    one) re-imports its own copy from disk instead of hitting a stale cache
+    entry (F1/F2 for the legacy import style).
+
+    Caller must hold _import_lock in the daemon process; pool workers run one
+    task at a time and may call it bare. Raises on any failure.
+    """
+    app_dir = os.path.realpath(os.path.dirname(app_path))
+    pkg_name = f"app_{app_name}__{uuid.uuid4().hex[:8]}"
+
+    before = set(sys.modules)
+
+    pkg_spec = importlib.machinery.ModuleSpec(pkg_name, None, is_package=True)
+    pkg_spec.submodule_search_locations = [app_dir]
+    sys.modules[pkg_name] = importlib.util.module_from_spec(pkg_spec)
+
+    spec = importlib.util.spec_from_file_location(f"{pkg_name}.main", app_path)
+    if spec is None or spec.loader is None:
+        sys.modules.pop(pkg_name, None)
+        raise ImportError(f"failed to create import spec for app '{app_name}'")
+
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec_module so circular and relative imports issued by
+    # main.py's body resolve while it is still executing.
+    sys.modules[spec.name] = module
+    try:
+        with _app_import_context(app_path):
+            spec.loader.exec_module(module)
+        if not callable(getattr(module, "execute", None)):
+            raise ImportError(
+                f"app '{app_name}' does not expose a callable execute(data) function"
+            )
+    except BaseException:
+        for key in [k for k in sys.modules if k == pkg_name or k.startswith(pkg_name + ".")]:
+            sys.modules.pop(key, None)
+        raise
+
+    # Commit: retire the previous version's namespace, then claim this one.
+    old_pkg = _app_active_pkg.get(app_name)
+    if old_pkg:
+        for key in [k for k in sys.modules if k == old_pkg or k.startswith(old_pkg + ".")]:
+            sys.modules.pop(key, None)
+    _app_active_pkg[app_name] = pkg_name
+
+    # Evict bare-name modules this load pulled in from inside the app dir
+    # (legacy `import utils` siblings and vendored libs/ packages) so they
+    # never satisfy another app's — or another version's — imports.
+    prefix = app_dir + os.sep
+    for key in set(sys.modules) - before:
+        if key == pkg_name or key.startswith(pkg_name + "."):
+            continue
+        origin = _module_origin(sys.modules.get(key))
+        if origin and os.path.realpath(origin).startswith(prefix):
+            sys.modules.pop(key, None)
+
+    return module
+
+
 def _load_app(app_name: str, app_path: str | None = None):
     """
     Dynamically load an app module from disk and atomically update the registry.
@@ -568,17 +680,10 @@ def _load_app(app_name: str, app_path: str | None = None):
         return None, f"app '{app_name}' not found in {APPS_DIR}"
 
     try:
-        with _app_import_context(app_path):
-            spec = importlib.util.spec_from_file_location(f"app_{app_name}", app_path)
-            if spec is None or spec.loader is None:
-                return None, f"failed to create import spec for app '{app_name}'"
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+        with _import_lock:
+            module = _import_app_module(app_name, app_path)
     except Exception as exc:
         return None, f"failed to load app '{app_name}': {exc}"
-
-    if not callable(getattr(module, "execute", None)):
-        return None, f"app '{app_name}' does not expose a callable execute(data) function"
 
     accepts_conn = "conn" in inspect.signature(module.execute).parameters
 
@@ -674,36 +779,54 @@ def _preload_apps() -> None:
 
 
 # ── Isolated subprocess entry point ───────────────────────────────────────────
-def _execute_app_isolated(app_path: str, data: dict) -> dict:
+def _execute_app_isolated(app_name: str, app_path: str, data: dict) -> dict:
     """
-    Run an app in a separate subprocess (via ProcessPoolExecutor).
-    Each invocation imports fresh — isolates the daemon from app memory leaks
-    and native extension faults. Uses short-lived psycopg2 connections for any
-    DB writes per the Direct DB Write Architecture.
+    Run an app inside a pooled worker subprocess (via ProcessPoolExecutor).
+
+    Workers are reused across jobs of different apps, so the app's module
+    namespace is rebuilt from disk on every invocation and torn down in the
+    finally block: a redeploy is always picked up by the next job, and one
+    app's modules can never satisfy another app's imports (F1/F2) — at the
+    cost of one re-import per job. The path context stays open across
+    execute() so lazy imports inside app code resolve (F3). Uses short-lived
+    psycopg2 connections for any DB writes per the Direct DB Write
+    Architecture.
     """
-    with _app_import_context(app_path):
-        spec = importlib.util.spec_from_file_location("app_isolated", app_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"failed to create import spec for {app_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    return module.execute(data)
+    before = set(sys.modules)
+    _purge_app_modules(app_name)
+    try:
+        module = _import_app_module(app_name, app_path)
+        with _app_import_context(app_path):
+            return module.execute(data)
+    finally:
+        _purge_app_modules(app_name)
+        # Drop anything this job imported from inside APPS_DIR (e.g. lazy bare
+        # imports during execute) so it cannot leak into the next job this
+        # worker picks up. Site-packages stay cached to keep workers warm.
+        apps_root = os.path.realpath(APPS_DIR) + os.sep
+        for key in set(sys.modules) - before:
+            origin = _module_origin(sys.modules.get(key))
+            if origin and os.path.realpath(origin).startswith(apps_root):
+                sys.modules.pop(key, None)
 
 
 def _run_sync_execute(module, payload: dict):
     """Execute a sync app, injecting a pooled connection when supported."""
     fn = getattr(module, "execute")
 
-    if _sync_db_pool is None or not _conn_capable.get(id(module), False):
-        return fn(payload)
+    # F3: keep the app dir + libs/ importable across the call so lazy imports
+    # inside execute() resolve.
+    with _app_import_context(module.__file__):
+        if _sync_db_pool is None or not _conn_capable.get(id(module), False):
+            return fn(payload)
 
-    conn = _sync_db_pool.getconn()
-    try:
-        with conn:
-            return fn(payload, conn=conn)
-    finally:
-        with contextlib.suppress(Exception):
-            _sync_db_pool.putconn(conn)
+        conn = _sync_db_pool.getconn()
+        try:
+            with conn:
+                return fn(payload, conn=conn)
+        finally:
+            with contextlib.suppress(Exception):
+                _sync_db_pool.putconn(conn)
 
 
 # ── DB helpers (async, asyncpg) ────────────────────────────────────────────────
@@ -839,7 +962,7 @@ async def _run_async_job(job_id: str, app_name: str, payload: dict) -> None:
     loop = asyncio.get_running_loop()
     try:
         result = await asyncio.wait_for(
-            loop.run_in_executor(_process_pool, _execute_app_isolated, app_path, payload),
+            loop.run_in_executor(_process_pool, _execute_app_isolated, app_name, app_path, payload),
             timeout=300.0,
         )
 
@@ -905,7 +1028,10 @@ async def _dispatch_execute(module, payload: dict):
     """
     fn = getattr(module, "execute")
     if asyncio.iscoroutinefunction(fn):
-        return await fn(payload)
+        # F3: pin the app's import paths across await points; the ref-counted
+        # context tolerates interleaved executions of other apps.
+        with _app_import_context(module.__file__):
+            return await fn(payload)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_thread_pool, _run_sync_execute, module, payload)
 
