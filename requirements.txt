@@ -1,4 +1,6 @@
 asyncpg>=0.29.0
 python-dotenv>=1.0.0
 psycopg2-binary>=2.9.0
-websockets>=13.0
+grpcio>=1.66.0
+grpcio-status>=1.66.0
+cryptography>=42.0

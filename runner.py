@@ -1,12 +1,19 @@
 """
 Noderouter Python Runner — Tunnel Architecture
 ==============================================
-Pure asyncio daemon. Establishes an outbound WebSocket tunnel to Go Core
-and processes tasks over it:
+Pure asyncio daemon. Establishes an outbound gRPC bidi-stream tunnel to Go
+Core (mutual TLS) and processes tasks over it:
 
-  Sync Channel  →  req/res frames over the WebSocket tunnel  (< 5 s tasks)
+  Sync Channel  →  Request/Response frames over the gRPC Tunnel stream  (< 5 s tasks)
   Async Channel →  PostgreSQL asyncpg LISTEN new_job + SKIP LOCKED claim
                    (long-running tasks; executed in isolated ProcessPoolExecutor)
+
+Transport security (self-managed, fully in-memory mTLS):
+  On every (re)connect the runner generates an ECDSA keypair in memory, sends
+  an HMAC-signed CSR to Core's plaintext Enroll RPC, and receives a client
+  cert + CA bundle issued by Core's ephemeral per-boot CA. The Tunnel stream
+  then runs over mTLS; nothing is ever written to disk. Core restarts rotate
+  the CA, which the per-connect re-enrollment makes self-healing.
 
 Hot-reload triggered by PostgreSQL NOTIFY app_updated via asyncpg LISTEN.
 No HTTP server is exposed — runners dial Core outbound; Core sends frames inward.
@@ -37,10 +44,18 @@ import uuid
 import zipfile
 
 import asyncpg
+import grpc
+import grpc.aio
 import psycopg2
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from psycopg2.pool import ThreadedConnectionPool
-import websockets
 from dotenv import load_dotenv
+
+import tunnel_pb2
+import tunnel_pb2_grpc
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -53,25 +68,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-def _resolve_core_ws_url() -> str:
-    ws_url = os.getenv("CORE_WS_URL", "").strip()
-    if ws_url:
-        return ws_url
-
-    core_url = os.getenv("CORE_URL", "").strip()
-    if core_url:
-        if core_url.startswith("http://"):
-            return "ws://" + core_url[7:]
-        if core_url.startswith("https://"):
-            return "wss://" + core_url[8:]
-        if core_url.startswith("ws://") or core_url.startswith("wss://"):
-            return core_url
-        return core_url
-
-    return "ws://localhost:3000"
+# CORE_GRPC_TARGET   — host:port of Core's mTLS Tunnel listener
+#                      (direct: noderouter-core:50051 / via NGINX stream: domain:8443)
+# CORE_ENROLL_TARGET — host:port of Core's plaintext Enroll listener
+#                      (direct: noderouter-core:50052 / via NGINX stream: domain:8444)
+CORE_GRPC_TARGET = os.getenv("CORE_GRPC_TARGET", "").strip() or "localhost:50051"
 
 
-CORE_WS_URL       = _resolve_core_ws_url()
+def _default_enroll_target() -> str:
+    """Same host as the tunnel target, default enroll port 50052."""
+    host = CORE_GRPC_TARGET.rsplit(":", 1)[0] if ":" in CORE_GRPC_TARGET else CORE_GRPC_TARGET
+    return f"{host}:50052"
+
+
+CORE_ENROLL_TARGET = os.getenv("CORE_ENROLL_TARGET", "").strip() or _default_enroll_target()
+
 NODE_ID           = os.getenv("NODE_ID", "")
 RUNNER_SECRET     = os.getenv("RUNNER_SECRET", "")
 APPS_DIR          = os.getenv(
@@ -82,8 +93,11 @@ DATABASE_URL      = os.getenv("DATABASE_URL", "")
 ASYNC_MAX_WORKERS = int(os.getenv("ASYNC_MAX_WORKERS", "4"))
 SYNC_MAX_WORKERS  = int(os.getenv("SYNC_MAX_WORKERS", "8"))
 
-_HMAC_TS_HEADER  = "X-Noderouter-Ts"
-_HMAC_SIG_HEADER = "X-Noderouter-Sig"
+# In-memory mTLS credentials — populated by _enroll() on each (re)connect.
+_client_cert_pem: bytes = b""
+_client_key_pem:  bytes = b""
+_ca_cert_pem:     bytes = b""
+_server_name:     str   = ""
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -119,19 +133,6 @@ _path_refs_lock = threading.Lock()
 _sync_semaphore: asyncio.Semaphore | None = None  # B9: bounds concurrent _handle_req tasks
 _app_load_locks: dict[str, asyncio.Lock] = {}     # B12: per-app load coalescing
 _app_load_locks_mu: asyncio.Lock | None = None    # guards _app_load_locks dict
-
-
-# ── HMAC Tunnel Signature ──────────────────────────────────────────────────────
-def _compute_tunnel_sig(ts: str, node_id: str) -> str:
-    """
-    Compute the tunnel-handshake HMAC signature.
-    Message scheme: "{timestamp}\\n{node_id}" — mirrors VerifyTunnelHandshake
-    in middleware/hmac.go on the Go Core side.
-    """
-    message = f"{ts}\n{node_id}".encode()
-    return "sha256=" + hmac_lib.new(
-        RUNNER_SECRET.encode(), message, hashlib.sha256
-    ).hexdigest()
 
 
 # ── Backoff ────────────────────────────────────────────────────────────────────
@@ -226,7 +227,7 @@ def _clear_persisted_node_id() -> None:
 
     Called by _tunnel_loop when Core returns 401/403 — indicates the node
     record was removed or the DB was wiped. Clearing the file forces the
-    next _resolve_node_id() call to auto-register fresh rather than replaying
+    next _enroll() call to register fresh rather than replaying
     a UUID that no longer exists in Core's database.
     """
     global NODE_ID
@@ -292,40 +293,126 @@ def _detect_location() -> str:
     return "cloud"
 
 
-def _derive_core_http_url() -> str:
-    """Convert the WS/WSS URL to HTTP/HTTPS for REST calls."""
-    url = CORE_WS_URL
-    if url.startswith("wss://"):
-        return "https://" + url[6:]
-    if url.startswith("ws://"):
-        return "http://" + url[5:]
-    return url
+def _enroll() -> None:
+    """
+    Generate an in-memory ECDSA P-256 keypair + CSR, send an HMAC-signed
+    Enroll RPC to Core's plaintext listener, verify the response signature,
+    and store the issued certs + node_id in module globals.
+
+    Called via asyncio.to_thread at the start of every tunnel connect iteration
+    so the runner always holds certs signed by Core's current ephemeral per-boot
+    CA — making Core restarts self-healing without any manual intervention.
+
+    Raises on failure; the tunnel loop retries with exponential backoff.
+    """
+    global NODE_ID, _client_cert_pem, _client_key_pem, _ca_cert_pem, _server_name
+    import socket
+
+    hostname   = os.getenv("HOSTNAME", socket.gethostname())
+    location   = _detect_location()
+    # runner_url is a stable per-machine identity — unique per container/host.
+    # Core uses it to detect and delete ghost nodes from previous Docker recreates
+    # (where the hostname changes but the physical machine is the same).
+    runner_url = f"runner://{hostname}"
+
+    # Restore previously-assigned NODE_ID from disk so Core can match the node row.
+    if not NODE_ID:
+        node_id_file = _node_id_file()
+        if os.path.isfile(node_id_file):
+            try:
+                val = open(node_id_file).read().strip()  # noqa: WPS515
+                if val:
+                    NODE_ID = val
+            except OSError:
+                pass
+
+    # Generate ephemeral ECDSA P-256 keypair entirely in memory.
+    key = ec.generate_private_key(ec.SECP256R1())
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+
+    # Build a CSR signed by our ephemeral private key.
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+        ]))
+        .sign(key, hashes.SHA256())
+    )
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM)
+
+    # HMAC over "{ts}\n{name}\n{sha256hex(csr_pem)}" — mirrors VerifyHMACIdentity
+    # in sorai-core/middleware/hmac.go.
+    ts       = str(int(time.time()))
+    csr_hash = hashlib.sha256(csr_pem).hexdigest()
+    message  = f"{ts}\n{hostname}\n{csr_hash}"
+    sig      = "sha256=" + hmac_lib.new(
+        RUNNER_SECRET.encode(), message.encode(), hashlib.sha256,
+    ).hexdigest()
+
+    channel = grpc.insecure_channel(CORE_ENROLL_TARGET)
+    try:
+        stub     = tunnel_pb2_grpc.TunnelServiceStub(channel)
+        metadata = [("x-noderouter-ts", ts), ("x-noderouter-sig", sig)]
+        resp = stub.Enroll(
+            tunnel_pb2.EnrollRequest(
+                name=hostname,
+                location_type=location,
+                runner_url=runner_url,
+                csr_pem=csr_pem,
+            ),
+            metadata=metadata,
+            timeout=10,
+        )
+    finally:
+        channel.close()
+
+    # Verify the response integrity to detect MITM / wrong RUNNER_SECRET.
+    cert_hash    = hashlib.sha256(resp.client_cert_pem).hexdigest()
+    ca_hash      = hashlib.sha256(resp.ca_cert_pem).hexdigest()
+    expected_msg = f"{resp.node_id}\n{cert_hash}\n{ca_hash}"
+    expected_sig = "sha256=" + hmac_lib.new(
+        RUNNER_SECRET.encode(), expected_msg.encode(), hashlib.sha256,
+    ).hexdigest()
+    if resp.response_sig != expected_sig:
+        raise ValueError("Enroll response_sig mismatch — possible MITM or wrong RUNNER_SECRET")
+
+    # Persist the assigned node_id for stable identity across reconnects.
+    NODE_ID = resp.node_id
+    os.makedirs(APPS_DIR, exist_ok=True)
+    node_id_file = _node_id_file()
+    try:
+        with open(node_id_file, "w") as fh:
+            fh.write(NODE_ID)
+    except OSError as exc:
+        log.warning("[enroll] Could not persist node_id: %s", exc)
+
+    _client_cert_pem = resp.client_cert_pem
+    _client_key_pem  = key_pem
+    _ca_cert_pem     = resp.ca_cert_pem
+    _server_name     = resp.server_name
+
+    log.info(
+        "[enroll] Enrolled: id=%s name=%s location=%s server=%s",
+        NODE_ID, resp.node_name, resp.location_type, _server_name,
+    )
 
 
 def _resolve_node_id() -> str:
     """
-    Resolve NODE_ID through three layers (highest priority first):
+    Restore NODE_ID from the env var or the persisted per-hostname file.
 
-    1. NODE_ID env var — set by the operator, takes unconditional precedence.
-    2. Persisted file  — written on first successful auto-registration.
-       Location: APPS_DIR/.node_id  (inside the shared apps volume, so it
-       survives Docker container re-creates and process restarts alike).
-    3. Auto-register   — POST /api/nodes/auto-register with HMAC body auth.
-       Hostname is used as the node name (idempotent: same hostname → same id).
-       Location type is detected automatically:
-         • docker_internal  — /.dockerenv present (standard Docker marker)
-         • localhost        — bare-metal / VM
-
-    Updates the module-level NODE_ID global and returns it.
-    Returns empty string if all three layers fail (tunnel loop will retry).
+    Actual enrollment (keypair + CSR + gRPC Enroll RPC) happens in _enroll(),
+    called per connect-iteration in _tunnel_loop. This function is only called
+    once at startup to surface a previously-assigned ID for the async listener
+    before the first tunnel connection is established.
     """
     global NODE_ID
-
-    # 1. Env var set by operator
     if NODE_ID:
         return NODE_ID
-
-    # 2. Persisted file (per-hostname — safe when APPS_DIR is a shared volume)
     node_id_file = _node_id_file()
     if os.path.isfile(node_id_file):
         try:
@@ -336,69 +423,7 @@ def _resolve_node_id() -> str:
                 return NODE_ID
         except OSError as exc:
             log.warning("[node-id] Could not read %s: %s", node_id_file, exc)
-
-    # 3. Auto-register via Core REST API
-    import socket
-    import urllib.error
-    import urllib.request
-
-    hostname    = os.getenv("HOSTNAME", socket.gethostname())
-    location    = _detect_location()
-    # runner_url is a stable per-machine identity used by Core to detect and
-    # delete ghost nodes left behind after Docker container recreates (where
-    # the hostname changes but the physical host is the same).
-    # MUST be "runner://<hostname>" — unique per machine/container — NOT
-    # CORE_WS_URL, which is identical across all runners and would cause Core's
-    # ghost-cleanup query to delete sibling runner nodes by mistake.
-    runner_url  = f"runner://{hostname}"
-    body        = json.dumps({"name": hostname, "location_type": location, "runner_url": runner_url}).encode()
-    base_url    = _derive_core_http_url()
-    endpoint    = f"{base_url}/api/nodes/auto-register"
-
-    for attempt in range(5):
-        if attempt:
-            delay = 2 * attempt
-            log.info("[node-id] Retrying auto-register in %ds (attempt %d/5) …", delay, attempt + 1)
-            time.sleep(delay)
-
-        # Refresh HMAC timestamp on every attempt to stay within the 30 s replay window.
-        ts          = str(int(time.time()))
-        body_hash   = hashlib.sha256(body).hexdigest()
-        message     = f"{ts}\n{body_hash}".encode()
-        sig         = "sha256=" + hmac_lib.new(
-            RUNNER_SECRET.encode(), message, hashlib.sha256,
-        ).hexdigest()
-
-        req = urllib.request.Request(
-            endpoint,
-            data=body,
-            headers={
-                "Content-Type":      "application/json",
-                "X-Noderouter-Ts":   ts,
-                "X-Noderouter-Sig":  sig,
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data    = json.loads(resp.read())
-                NODE_ID = data["node_id"]
-                os.makedirs(APPS_DIR, exist_ok=True)
-                with open(node_id_file, "w") as fh:
-                    fh.write(NODE_ID)
-                log.info(
-                    "[node-id] Auto-registered: id=%s name=%s location=%s",
-                    NODE_ID, hostname, location,
-                )
-                return NODE_ID
-        except Exception as exc:
-            log.warning("[node-id] Auto-register attempt %d/5 failed: %s", attempt + 1, exc)
-
-    log.error(
-        "[node-id] Auto-registration failed after 5 attempts — "
-        "tunnel will connect without NODE_ID (async job routing disabled)"
-    )
-    return ""
+    return NODE_ID
 
 
 # ── ZIP extraction helpers ─────────────────────────────────────────────────────
@@ -1036,10 +1061,13 @@ async def _dispatch_execute(module, payload: dict):
     return await loop.run_in_executor(_thread_pool, _run_sync_execute, module, payload)
 
 
-# ── Sync request handler (tunnel req frame) ────────────────────────────────────
-async def _handle_req(ws, msg: dict) -> None:
+# ── Sync request handler (tunnel Request frame) ───────────────────────────────
+async def _handle_req(send, req: tunnel_pb2.Request) -> None:
     """
-    Handle a single synchronous req frame received from Core over the tunnel.
+    Handle a single synchronous Request frame received from Core over the Tunnel.
+
+    `send` is outq.put_nowait — synchronous, unbounded, always-succeeds so
+    the always-respond guarantee (B11) holds without await in the error path.
 
     Performance improvements applied:
       B8  Lock-free _get_app() read — GIL makes dict.get() atomic; no lock needed.
@@ -1052,28 +1080,26 @@ async def _handle_req(ws, msg: dict) -> None:
       B12 Per-app asyncio.Lock coalesces concurrent cache-miss loads so the
           same module is never imported in parallel by multiple coroutines.
     """
-    rid      = msg.get("rid", "")
-    app_name = msg.get("app", "")
-    payload  = msg.get("payload") or {}
+    rid      = req.rid
+    app_name = req.app
+    payload  = json.loads(req.payload) if req.payload else {}
 
-    # B11: catch serialization failures so Core's goroutine always gets a frame
-    # back; previously a non-serializable result silently caused a 30 s timeout.
-    async def _send_res(status: int, body: dict) -> None:
+    # B11: catch serialization failures so Core's goroutine always gets a frame.
+    def _send_res(status: int, body: dict) -> None:
         try:
-            frame = json.dumps({"type": "res", "rid": rid, "status": status, "body": body})
+            body_bytes = json.dumps(body).encode()
         except (TypeError, ValueError) as exc:
             log.error("Sync res serialization error rid=%s: %s", rid, exc)
-            frame = json.dumps({
-                "type": "res", "rid": rid, "status": 500,
-                "body": {"error": "response serialization failed"},
-            })
+            body_bytes = json.dumps({"error": "response serialization failed"}).encode()
         try:
-            await ws.send(frame)
+            send(tunnel_pb2.RunnerFrame(
+                response=tunnel_pb2.Response(rid=rid, status=status, body=body_bytes),
+            ))
         except Exception as exc:
             log.debug("Tunnel send failed rid=%s: %s", rid, exc)
 
     if err := _validate_app_name(app_name):
-        await _send_res(400, {"error": err})
+        _send_res(400, {"error": err})
         return
 
     # B8: lock-free registry read (GIL-safe).
@@ -1092,7 +1118,7 @@ async def _handle_req(ws, msg: dict) -> None:
             if module is None:
                 module, load_err = await asyncio.to_thread(_load_app, app_name)
                 if load_err:
-                    await _send_res(404, {"error": load_err})
+                    _send_res(404, {"error": load_err})
                     return
 
     try:
@@ -1112,21 +1138,22 @@ async def _handle_req(ws, msg: dict) -> None:
             if isinstance(raw, list):
                 actions_to_dispatch = raw
 
-        await _send_res(200, result if isinstance(result, dict) else {"result": result})
+        _send_res(200, result if isinstance(result, dict) else {"result": result})
 
-        # Send action frames to Core after the response is delivered so the
-        # calling client is unblocked before we fire notifications.
+        # Send action frames after the response so the calling client is
+        # unblocked before we fire notifications.
         for act in actions_to_dispatch:
             if not isinstance(act, dict) or not act.get("name"):
                 continue
             try:
-                frame = json.dumps({
-                    "type":        "action",
-                    "app_name":    app_name,
-                    "action_name": act["name"],
-                    "payload":     act.get("payload"),
-                })
-                await ws.send(frame)
+                act_payload = act.get("payload") or {}
+                send(tunnel_pb2.RunnerFrame(
+                    action=tunnel_pb2.Action(
+                        app_name=app_name,
+                        action_name=act["name"],
+                        payload=json.dumps(act_payload).encode(),
+                    ),
+                ))
                 log.debug("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
             except Exception as exc:
                 log.debug(
@@ -1135,99 +1162,135 @@ async def _handle_req(ws, msg: dict) -> None:
                 )
     except Exception as exc:
         log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
-        await _send_res(500, {"error": str(exc)})
+        _send_res(500, {"error": str(exc)})
 
 
-async def _handle_req_with_permit(ws, msg: dict) -> None:
+async def _handle_req_with_permit(send, req: tunnel_pb2.Request) -> None:
     try:
-        await _handle_req(ws, msg)
+        await _handle_req(send, req)
     finally:
         if _sync_semaphore is not None:
             _sync_semaphore.release()
 
 
-# ── WebSocket Tunnel Loop ──────────────────────────────────────────────────────
+# ── gRPC mTLS Tunnel Loop ─────────────────────────────────────────────────────
 async def _tunnel_loop() -> None:
     """
-    Persistent outbound WebSocket tunnel to Go Core.
-    Reconnects automatically using exponential backoff.
+    Persistent outbound gRPC mTLS Tunnel to Go Core.
 
-    Frame types (Core → Runner): hello, ping, req
-    Frame types (Runner → Core): pong, res
+    Each (re)connect iteration:
+      1. Enroll — generate ephemeral ECDSA keypair + CSR, send HMAC-signed
+         Enroll RPC to Core's plaintext listener, receive signed client cert +
+         CA bundle. Core restarts rotate the per-boot CA; re-enrollment makes
+         this self-healing without any manual intervention.
+      2. Dial — open a secure_channel with the enrolled certs (mTLS).
+      3. Stream — bidirectional Tunnel RPC; dispatch CoreFrames inbound,
+         queue RunnerFrames outbound via asyncio.Queue.
+
+    Frame types (Core → Runner): hello, ping, request, event
+    Frame types (Runner → Core): pong, response, action
     """
     attempt = 0
-    uri = f"{CORE_WS_URL}/api/nodes/connect"
 
     while not _shutdown_event.is_set():
+        # ── 1. Enroll: get fresh certs from Core's ephemeral CA ───────────────
         try:
-            ts = str(int(time.time()))
-            headers = {
-                "X-Node-ID":     NODE_ID,
-                _HMAC_TS_HEADER: ts,
-            }
-            if RUNNER_SECRET and NODE_ID:
-                headers[_HMAC_SIG_HEADER] = _compute_tunnel_sig(ts, NODE_ID)
-
-            async with websockets.connect(uri, additional_headers=headers) as ws:
-                attempt = 0
-                log.info("[tunnel] Connected to core at %s", uri)
-
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    t = msg.get("type")
-                    if t == "hello":
-                        log.info("[tunnel] Hello from core: node_name=%s", msg.get("node_name"))
-                    elif t == "ping":
-                        await ws.send(json.dumps({"type": "pong"}))
-                    elif t == "req":
-                        if _sync_semaphore is None:
-                            asyncio.create_task(_handle_req(ws, msg))
-                            continue
-                        await _sync_semaphore.acquire()
-                        try:
-                            asyncio.create_task(_handle_req_with_permit(ws, msg))
-                        except Exception:
-                            _sync_semaphore.release()
-                            raise
-
+            await asyncio.to_thread(_enroll)
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            # ── 401 / 403: Core rejected our node_id ─────────────────────────
-            # This happens when the node record was deleted from Core's DB
-            # (admin removal, DB wipe, disaster recovery). Clear the persisted
-            # node_id and re-register so we get a fresh UUID.
-            status_code = getattr(exc, "status_code", None)
-            if status_code in (401, 403):
+            delay = _backoff(attempt)
+            log.error("[tunnel] Enroll failed: %s — retrying in %.1fs", exc, delay)
+            attempt += 1
+            try:
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        # ── 2. Dial Core with mTLS using the enrolled certs ───────────────────
+        channel_creds = grpc.ssl_channel_credentials(
+            root_certificates=_ca_cert_pem,
+            private_key=_client_key_pem,
+            certificate_chain=_client_cert_pem,
+        )
+        channel_opts = [
+            ("grpc.ssl_target_name_override",     _server_name),
+            ("grpc.max_receive_message_length",   16 << 20),
+            ("grpc.max_send_message_length",       16 << 20),
+            ("grpc.keepalive_time_ms",             60_000),
+            ("grpc.keepalive_permit_without_calls", 1),
+        ]
+
+        try:
+            async with grpc.aio.secure_channel(
+                CORE_GRPC_TARGET, channel_creds, options=channel_opts,
+            ) as channel:
+                stub = tunnel_pb2_grpc.TunnelServiceStub(channel)
+                outq: asyncio.Queue = asyncio.Queue()
+
+                async def _outgoing():
+                    while True:
+                        frame = await outq.get()
+                        if frame is None:
+                            return
+                        yield frame
+
+                call = stub.Tunnel(_outgoing())
+                attempt = 0
+                log.info("[tunnel] Connected to %s (node_id=%s)", CORE_GRPC_TARGET, NODE_ID)
+
+                try:
+                    async for core_frame in call:
+                        which = core_frame.WhichOneof("frame")
+                        if which == "hello":
+                            log.info(
+                                "[tunnel] Hello: node_id=%s node_name=%s",
+                                core_frame.hello.node_id, core_frame.hello.node_name,
+                            )
+                        elif which == "ping":
+                            outq.put_nowait(tunnel_pb2.RunnerFrame(pong=tunnel_pb2.Pong()))
+                        elif which == "request":
+                            req  = core_frame.request
+                            send = outq.put_nowait
+                            if _sync_semaphore is None:
+                                asyncio.create_task(_handle_req(send, req))
+                            else:
+                                await _sync_semaphore.acquire()
+                                try:
+                                    asyncio.create_task(_handle_req_with_permit(send, req))
+                                except Exception:
+                                    _sync_semaphore.release()
+                                    raise
+                        # "event" frames from Core (hub broadcasts) — runner ignores
+                finally:
+                    outq.put_nowait(None)  # unblock _outgoing generator
+
+        except asyncio.CancelledError:
+            return
+        except grpc.aio.AioRpcError as exc:
+            code = exc.code()
+            if code == grpc.StatusCode.PERMISSION_DENIED:
+                # Node row deleted — clear cached id so next enroll creates a fresh one.
                 log.warning(
-                    "[tunnel] Core rejected node_id=%s (HTTP %d) — "
-                    "clearing cached id and re-registering",
-                    NODE_ID, status_code,
+                    "[tunnel] PERMISSION_DENIED (node_id=%s deleted?) — "
+                    "clearing cached id and re-enrolling immediately",
+                    NODE_ID,
                 )
                 _clear_persisted_node_id()
-                await asyncio.to_thread(_resolve_node_id)
-                if NODE_ID:
-                    log.info("[tunnel] Re-registered as node_id=%s — reconnecting now", NODE_ID)
-                    attempt = 0  # reset backoff after successful re-registration
-                else:
-                    # Auto-registration failed (Core unreachable, bad secret, etc.).
-                    # Back off before retrying so we don't hammer Core.
-                    delay = _backoff(attempt)
-                    log.error(
-                        "[tunnel] Re-registration failed — backing off %.1fs", delay
-                    )
-                    attempt += 1
-                    try:
-                        await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
-                    except asyncio.TimeoutError:
-                        pass
+                attempt = 0
                 continue
-
-            # ── All other errors: network drop, timeout, etc. ─────────────────
+            delay = _backoff(attempt)
+            log.error(
+                "[tunnel] gRPC error %s: %s — reconnecting in %.1fs",
+                code, exc.details(), delay,
+            )
+            attempt += 1
+            try:
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        except Exception as exc:
             delay = _backoff(attempt)
             log.error("[tunnel] Error: %s — reconnecting in %.1fs", exc, delay)
             attempt += 1
@@ -1389,16 +1452,17 @@ async def main() -> None:
     # Windows: KeyboardInterrupt is caught at the asyncio.run() level below.
 
     log.info("=" * 60)
-    log.info("Noderouter Python Runner — Tunnel Architecture")
-    log.info("  Core WS URL  : %s", CORE_WS_URL)
-    log.info("  Node ID      : %s", NODE_ID or "(resolving…)")
-    log.info("  Apps         : %s", APPS_DIR)
-    log.info("  Async Chan   : %s", "enabled" if DATABASE_URL else "disabled (DATABASE_URL not set)")
-    log.info("  Async Workers: %d", ASYNC_MAX_WORKERS)
-    log.info("  Sync Workers : %d", SYNC_MAX_WORKERS)
+    log.info("Noderouter Python Runner — gRPC mTLS Tunnel")
+    log.info("  Tunnel target : %s", CORE_GRPC_TARGET)
+    log.info("  Enroll target : %s", CORE_ENROLL_TARGET)
+    log.info("  Node ID       : %s", NODE_ID or "(enrolling on first connect…)")
+    log.info("  Apps          : %s", APPS_DIR)
+    log.info("  Async Chan    : %s", "enabled" if DATABASE_URL else "disabled (DATABASE_URL not set)")
+    log.info("  Async Workers : %d", ASYNC_MAX_WORKERS)
+    log.info("  Sync Workers  : %d", SYNC_MAX_WORKERS)
     log.info("=" * 60)
 
-    # Resolve NODE_ID: env var → persisted file → auto-register with Core.
+    # Resolve NODE_ID: env var → persisted file (enrollment happens in _tunnel_loop).
     # Must run after app preload so APPS_DIR exists for the .node_id file.
     await asyncio.to_thread(_resolve_node_id)
     if NODE_ID:

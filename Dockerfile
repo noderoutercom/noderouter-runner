@@ -31,8 +31,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
     && rm -rf /wheels
 
-# Copy runner source
-COPY runner.py .
+# Copy runner source + generated protobuf stubs
+COPY runner.py tunnel_pb2.py tunnel_pb2_grpc.py ./
 
 # Pre-create the apps directory; typically mounted as a shared volume
 RUN mkdir -p /apps
@@ -50,7 +50,6 @@ ENV APPS_DIR=/apps \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# The runner dials Go Core outbound over WebSocket; no inbound port is needed.
-# If a future HTTP reload endpoint is added, expose 8000 here.
+# The runner dials Go Core outbound over gRPC mTLS; no inbound port is needed.
 
 ENTRYPOINT ["python", "-u", "runner.py"]
