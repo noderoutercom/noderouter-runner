@@ -31,6 +31,7 @@ import inspect
 import io
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import re
@@ -51,7 +52,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
-from psycopg2.pool import ThreadedConnectionPool
 from dotenv import load_dotenv
 
 import tunnel_pb2
@@ -111,14 +111,40 @@ _process_pool: concurrent.futures.ProcessPoolExecutor | None = None
 _thread_pool:  concurrent.futures.ThreadPoolExecutor  | None = None
 
 # ── DB Pool (asyncpg) ─────────────────────────────────────────────────────────
+# The runner keeps a Postgres pool for its OWN control-plane work (job claim,
+# status updates, app blob fetch, LISTEN/NOTIFY). Apps NEVER touch Postgres
+# directly — all app SQL flows through registered named queries over the tunnel
+# (see the Named Query Client section). DATABASE_URL is stripped from app
+# subprocesses so app code cannot open its own connection.
 _db_pool: asyncpg.Pool | None = None
-_sync_db_pool: ThreadedConnectionPool | None = None
 
 # ── App Registry ───────────────────────────────────────────────────────────────
 _app_registry: dict = {}
 _registry_lock = threading.Lock()   # sync lock — held only during writes in _load_app
 _import_lock = threading.Lock()      # serialises app module imports in the daemon process
-_conn_capable:  dict[int, bool] = {}
+_exec_params: dict[int, set] = {}    # id(module) → execute() parameter names
+_app_versions: dict[str, str] = {}   # app_name → manifest version (sent in QueryRequest)
+
+# ── Named Query Client (apps → Core over the tunnel) ──────────────────────────
+# QUERY_TIMEOUT bounds a single named-query round-trip. Set below the Core
+# Send timeout so a hung query surfaces as an app error, not a tunnel stall.
+QUERY_TIMEOUT = 30.0
+_event_loop: asyncio.AbstractEventLoop | None = None   # set in main()
+_tunnel_outq: asyncio.Queue | None = None              # live tunnel outbound queue
+_query_pending: dict[str, asyncio.Future] = {}         # qid → Future((status, rows, error))
+
+# ── Subprocess → parent query bridge (async-job ProcessPoolExecutor workers) ──
+# Subprocess workers cannot reach the event loop / tunnel, so query() and
+# report_progress() marshal requests to the parent over Manager queues. The
+# parent's _bridge_drain_loop forwards them to the tunnel / job table.
+_bridge_req_q = None          # Manager Queue: workers → parent  (kind, idx, payload)
+_bridge_resp_qs = None        # list[Manager Queue]: parent → worker[idx]
+_bridge_idx = None            # Manager Value('i'): hands out worker slot indices
+_bridge_idx_lock = None       # Manager Lock guarding _bridge_idx
+# Worker-local (set by _worker_init in each subprocess):
+_W_REQ_Q = None
+_W_RESP_Q = None
+_W_IDX = 0
 
 # ── Per-app module namespaces (F1/F2) ──────────────────────────────────────────
 # Each app loads under a unique synthetic package (see _import_app_module), so
@@ -710,12 +736,26 @@ def _load_app(app_name: str, app_path: str | None = None):
     except Exception as exc:
         return None, f"failed to load app '{app_name}': {exc}"
 
-    accepts_conn = "conn" in inspect.signature(module.execute).parameters
+    params = set(inspect.signature(module.execute).parameters)
+    # Tag the module so the sync/async injectors know which app owns it (needed
+    # to scope named queries) without a reverse registry lookup.
+    setattr(module, "__noderouter_app__", app_name)
+
+    # Read manifest version so it can be included in QueryRequest frames.
+    # Core uses the version to detect a stale cache entry and reload from DB.
+    version = ""
+    manifest_path = os.path.join(os.path.dirname(app_path), "manifest.json")
+    try:
+        with open(manifest_path) as _mf:
+            version = json.load(_mf).get("version", "")
+    except Exception:
+        pass
+    _app_versions[app_name] = version
 
     with _registry_lock:
         _app_registry[app_name] = module
-    _conn_capable[id(module)] = accepts_conn
-    log.info("App loaded: %s (%s) [conn-injection: %s]", app_name, app_path, accepts_conn)
+    _exec_params[id(module)] = params
+    log.info("App loaded: %s (%s) v%s [query-injection: %s]", app_name, app_path, version or "?", "query" in params)
     return module, None
 
 
@@ -813,16 +853,27 @@ def _execute_app_isolated(app_name: str, app_path: str, data: dict) -> dict:
     finally block: a redeploy is always picked up by the next job, and one
     app's modules can never satisfy another app's imports (F1/F2) — at the
     cost of one re-import per job. The path context stays open across
-    execute() so lazy imports inside app code resolve (F3). Uses short-lived
-    psycopg2 connections for any DB writes per the Direct DB Write
-    Architecture.
+    execute() so lazy imports inside app code resolve (F3).
+
+    App SQL runs exclusively through the injected query() client, which
+    marshals to the parent process over the Manager bridge and out to Core
+    (named-queries-only). report_progress() likewise bridges to the parent's
+    job-table writer. DATABASE_URL is stripped from this subprocess by
+    _worker_init, so apps cannot open a direct Postgres connection.
     """
     before = set(sys.modules)
     _purge_app_modules(app_name)
     try:
         module = _import_app_module(app_name, app_path)
+        params = set(inspect.signature(module.execute).parameters)
+        kwargs = {}
+        if "query" in params:
+            kwargs["query"] = lambda name, p=None: _worker_query(app_name, name, p)
+        if "report_progress" in params:
+            job_id = data.get("_job_id", "")
+            kwargs["report_progress"] = lambda pct, _jid=job_id: _worker_report_progress(_jid, pct)
         with _app_import_context(app_path):
-            return module.execute(data)
+            return module.execute(data, **kwargs)
     finally:
         _purge_app_modules(app_name)
         # Drop anything this job imported from inside APPS_DIR (e.g. lazy bare
@@ -836,22 +887,23 @@ def _execute_app_isolated(app_name: str, app_path: str, data: dict) -> dict:
 
 
 def _run_sync_execute(module, payload: dict):
-    """Execute a sync app, injecting a pooled connection when supported."""
+    """
+    Execute a sync app in a thread-pool worker, injecting a blocking query()
+    client when the app declares it. Apps hold no DB connection — query()
+    bridges to Core over the tunnel (named-queries-only).
+    """
     fn = getattr(module, "execute")
+    params = _exec_params.get(id(module)) or set(inspect.signature(fn).parameters)
+    app_name = getattr(module, "__noderouter_app__", "")
+
+    kwargs = {}
+    if "query" in params:
+        kwargs["query"] = lambda name, p=None: _query_threadsafe(name, p, app_name=app_name)
 
     # F3: keep the app dir + libs/ importable across the call so lazy imports
     # inside execute() resolve.
     with _app_import_context(module.__file__):
-        if _sync_db_pool is None or not _conn_capable.get(id(module), False):
-            return fn(payload)
-
-        conn = _sync_db_pool.getconn()
-        try:
-            with conn:
-                return fn(payload, conn=conn)
-        finally:
-            with contextlib.suppress(Exception):
-                _sync_db_pool.putconn(conn)
+        return fn(payload, **kwargs)
 
 
 # ── DB helpers (async, asyncpg) ────────────────────────────────────────────────
@@ -875,6 +927,164 @@ async def _update_job(job_id: str, **fields) -> None:
             f"UPDATE {_JOB_TABLE} SET {set_clause}, updated_at = NOW() WHERE id = $1",
             job_id, *values,
         )
+
+
+# ── Named Query Client ─────────────────────────────────────────────────────────
+class QueryError(Exception):
+    """Raised when a named query fails. Carries an HTTP-style status code."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+async def _send_query(query_name: str, params, app_name: str):
+    """
+    Send a registered named-query request to Core over the tunnel and await the
+    QueryResponse. Runs on the event loop. Returns the decoded rows (a list) or
+    raises QueryError. This is the single egress point for ALL app SQL.
+    """
+    outq = _tunnel_outq
+    if outq is None or _event_loop is None:
+        raise QueryError(503, "tunnel not connected")
+
+    qid = uuid.uuid4().hex
+    fut: asyncio.Future = _event_loop.create_future()
+    _query_pending[qid] = fut
+    try:
+        outq.put_nowait(tunnel_pb2.RunnerFrame(
+            query_request=tunnel_pb2.QueryRequest(
+                qid=qid,
+                query_name=query_name,
+                params=json.dumps(params if params is not None else []).encode(),
+                app_name=app_name or "",
+                app_version=_app_versions.get(app_name, "") if app_name else "",
+            ),
+        ))
+        try:
+            status, rows, error = await asyncio.wait_for(fut, timeout=QUERY_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise QueryError(504, f"query '{query_name}' timed out")
+    finally:
+        _query_pending.pop(qid, None)
+
+    if status != 200:
+        raise QueryError(status, error or f"query '{query_name}' failed")
+    return rows
+
+
+def _resolve_query_response(qr) -> None:
+    """Resolve the pending future for a QueryResponse CoreFrame (event-loop side)."""
+    fut = _query_pending.get(qr.qid)
+    if fut is None or fut.done():
+        return
+    rows = []
+    if qr.rows:
+        try:
+            rows = json.loads(qr.rows)
+        except Exception:
+            rows = []
+    fut.set_result((qr.status, rows, qr.error))
+
+
+def _fail_pending_queries(reason: str) -> None:
+    """Fail every in-flight query (called when the tunnel drops)."""
+    for qid, fut in list(_query_pending.items()):
+        if not fut.done():
+            fut.set_result((503, [], reason))
+    _query_pending.clear()
+
+
+def _query_threadsafe(query_name: str, params=None, *, app_name: str):
+    """
+    Blocking named-query call for sync apps running in the thread pool. Bridges
+    into the event loop via run_coroutine_threadsafe. Raises QueryError.
+    """
+    if _event_loop is None:
+        raise QueryError(503, "event loop not ready")
+    fut = asyncio.run_coroutine_threadsafe(
+        _send_query(query_name, params, app_name), _event_loop,
+    )
+    return fut.result(timeout=QUERY_TIMEOUT + 5)
+
+
+# ── Subprocess → parent bridge (async-job workers) ────────────────────────────
+def _worker_init(req_q, resp_qs, idx_counter, idx_lock) -> None:
+    """
+    ProcessPoolExecutor initializer. Assigns each worker a stable slot index and
+    stashes the Manager queues so query()/report_progress() can marshal to the
+    parent. Strips DATABASE_URL so app code in this subprocess CANNOT open a
+    direct Postgres connection (named-queries-only enforcement).
+    """
+    global _W_REQ_Q, _W_RESP_Q, _W_IDX
+    with idx_lock:
+        i = idx_counter.value
+        idx_counter.value = i + 1
+    _W_IDX = i % len(resp_qs)
+    _W_REQ_Q = req_q
+    _W_RESP_Q = resp_qs[_W_IDX]
+    os.environ.pop("DATABASE_URL", None)
+
+
+def _worker_query(app_name: str, query_name: str, params=None):
+    """Subprocess-side query(): marshals to the parent and blocks for the result."""
+    if _W_REQ_Q is None or _W_RESP_Q is None:
+        raise RuntimeError("query bridge not initialised in this worker")
+    _W_REQ_Q.put(("query", _W_IDX, {
+        "name": query_name, "params": params, "app_name": app_name,
+    }))
+    status, rows, error = _W_RESP_Q.get()
+    if status != 200:
+        raise RuntimeError(f"query '{query_name}' failed ({status}): {error}")
+    return rows
+
+
+def _worker_report_progress(job_id: str, percent) -> None:
+    """Subprocess-side report_progress(): fire-and-forget to the parent."""
+    if _W_REQ_Q is None or not job_id:
+        return
+    try:
+        _W_REQ_Q.put(("progress", _W_IDX, {"job_id": job_id, "progress": int(percent)}))
+    except Exception:
+        pass
+
+
+def _bridge_drain_loop() -> None:
+    """
+    Parent-side drainer (daemon thread). Forwards worker query/progress requests
+    onto the event loop WITHOUT blocking on each one: query results are returned
+    to the worker via a done-callback so many subprocess queries run concurrently.
+    """
+    while True:
+        try:
+            kind, idx, payload = _bridge_req_q.get()
+        except (EOFError, OSError):
+            return
+        if kind == "__stop__":
+            return
+        if _event_loop is None:
+            if kind == "query":
+                _bridge_resp_qs[idx].put((503, None, "event loop not ready"))
+            continue
+
+        if kind == "query":
+            coro = _send_query(payload["name"], payload["params"], payload["app_name"])
+            cfut = asyncio.run_coroutine_threadsafe(coro, _event_loop)
+
+            def _done(f, _idx=idx):
+                try:
+                    _bridge_resp_qs[_idx].put((200, f.result(), ""))
+                except QueryError as qe:
+                    _bridge_resp_qs[_idx].put((qe.status, None, str(qe)))
+                except Exception as exc:  # noqa: BLE001
+                    _bridge_resp_qs[_idx].put((500, None, str(exc)))
+
+            cfut.add_done_callback(_done)
+        elif kind == "progress":
+            asyncio.run_coroutine_threadsafe(
+                _update_job(payload["job_id"], progress=payload["progress"]),
+                _event_loop,
+            )
 
 
 async def _fetch_pending_job(job_id: str) -> tuple[str, dict] | None:
@@ -1053,10 +1263,17 @@ async def _dispatch_execute(module, payload: dict):
     """
     fn = getattr(module, "execute")
     if asyncio.iscoroutinefunction(fn):
+        params = _exec_params.get(id(module)) or set(inspect.signature(fn).parameters)
+        app_name = getattr(module, "__noderouter_app__", "")
+        kwargs = {}
+        if "query" in params:
+            async def _q(name, p=None, _app=app_name):
+                return await _send_query(name, p, _app)
+            kwargs["query"] = _q
         # F3: pin the app's import paths across await points; the ref-counted
         # context tolerates interleaved executions of other apps.
         with _app_import_context(module.__file__):
-            return await fn(payload)
+            return await fn(payload, **kwargs)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_thread_pool, _run_sync_execute, module, payload)
 
@@ -1187,9 +1404,10 @@ async def _tunnel_loop() -> None:
       3. Stream — bidirectional Tunnel RPC; dispatch CoreFrames inbound,
          queue RunnerFrames outbound via asyncio.Queue.
 
-    Frame types (Core → Runner): hello, ping, request, event
-    Frame types (Runner → Core): pong, response, action
+    Frame types (Core → Runner): hello, ping, request, event, query_response
+    Frame types (Runner → Core): pong, response, action, query_request
     """
+    global _tunnel_outq
     attempt = 0
 
     while not _shutdown_event.is_set():
@@ -1237,6 +1455,9 @@ async def _tunnel_loop() -> None:
                         yield frame
 
                 call = stub.Tunnel(_outgoing())
+                # Publish the outbound queue so the named-query client can send
+                # QueryRequest frames while this stream is live.
+                _tunnel_outq = outq
                 attempt = 0
                 log.info("[tunnel] Connected to %s (node_id=%s)", CORE_GRPC_TARGET, NODE_ID)
 
@@ -1262,8 +1483,12 @@ async def _tunnel_loop() -> None:
                                 except Exception:
                                     _sync_semaphore.release()
                                     raise
+                        elif which == "query_response":
+                            _resolve_query_response(core_frame.query_response)
                         # "event" frames from Core (hub broadcasts) — runner ignores
                 finally:
+                    _tunnel_outq = None
+                    _fail_pending_queries("tunnel disconnected")
                     outq.put_nowait(None)  # unblock _outgoing generator
 
         except asyncio.CancelledError:
@@ -1433,7 +1658,7 @@ async def _async_listener_loop() -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 async def main() -> None:
-    global _shutdown_event, _db_pool, _sync_db_pool, _sync_semaphore, _app_load_locks_mu
+    global _shutdown_event, _db_pool, _sync_semaphore, _app_load_locks_mu, _event_loop
     _shutdown_event = asyncio.Event()
 
     # B9: initialise semaphore now that the event loop is running.
@@ -1446,6 +1671,7 @@ async def main() -> None:
     _app_load_locks_mu = asyncio.Lock()
 
     loop = asyncio.get_running_loop()
+    _event_loop = loop  # published for the named-query client (thread/subprocess bridges)
     if not _IS_WINDOWS:
         loop.add_signal_handler(signal.SIGTERM, _shutdown_event.set)
         loop.add_signal_handler(signal.SIGINT,  _shutdown_event.set)
@@ -1471,21 +1697,13 @@ async def main() -> None:
     # Preload apps synchronously before accepting any tunnel requests.
     await asyncio.to_thread(_preload_apps)
 
-    if DATABASE_URL:
-        try:
-            _sync_db_pool = ThreadedConnectionPool(
-                2,
-                max(SYNC_MAX_WORKERS, ASYNC_MAX_WORKERS) + 4,
-                dsn=DATABASE_URL,
-            )
-            log.info(
-                "psycopg2 threaded pool initialized (min=2, max=%d)",
-                max(SYNC_MAX_WORKERS, ASYNC_MAX_WORKERS) + 4,
-            )
-        except Exception as exc:
-            _sync_db_pool = None
-            log.warning("psycopg2 threaded pool initialization failed: %s", exc)
+    # Start the subprocess→parent query bridge drainer (daemon thread). It
+    # forwards async-job worker query()/report_progress() calls onto this loop.
+    if _bridge_req_q is not None:
+        threading.Thread(target=_bridge_drain_loop, name="query-bridge", daemon=True).start()
+        log.info("Query bridge drainer started (async-job workers → tunnel)")
 
+    if DATABASE_URL:
         _db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
@@ -1502,11 +1720,15 @@ async def main() -> None:
     await _shutdown_event.wait()
     log.info("Shutting down noderouter-runner…")
 
+    # Stop the bridge drainer so its blocking get() unwinds cleanly.
+    if _bridge_req_q is not None:
+        try:
+            _bridge_req_q.put(("__stop__", 0, None))
+        except Exception:
+            pass
+
     if _db_pool:
         await _db_pool.close()
-    if _sync_db_pool:
-        _sync_db_pool.closeall()
-        _sync_db_pool = None
     if _process_pool:
         _process_pool.shutdown(wait=False)
     if _thread_pool:
@@ -1517,10 +1739,25 @@ if __name__ == "__main__":
     if not RUNNER_SECRET:
         log.warning("RUNNER_SECRET is not set — HMAC auth disabled (dev mode only)")
 
+    # Subprocess→parent query bridge primitives. Created via a Manager so the
+    # queue proxies are picklable into ProcessPoolExecutor workers. One response
+    # queue per worker slot (with 4× headroom for crash-respawned workers).
+    _bridge_resp_slots = max(ASYNC_MAX_WORKERS, 1) * 4
+    _mp_manager = multiprocessing.Manager()
+    _bridge_req_q = _mp_manager.Queue()
+    _bridge_resp_qs = [_mp_manager.Queue() for _ in range(_bridge_resp_slots)]
+    _bridge_idx = _mp_manager.Value("i", 0)
+    _bridge_idx_lock = _mp_manager.Lock()
+
     # Initialise executor pools before asyncio.run() to avoid Windows spawn recursion:
     # ProcessPoolExecutor uses 'spawn' on Windows, which re-imports this module in
     # every subprocess — module-level pool creation would cause infinite spawning.
-    _process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=ASYNC_MAX_WORKERS)
+    # Each worker runs _worker_init to claim a slot and strip DATABASE_URL.
+    _process_pool = concurrent.futures.ProcessPoolExecutor(
+        max_workers=ASYNC_MAX_WORKERS,
+        initializer=_worker_init,
+        initargs=(_bridge_req_q, _bridge_resp_qs, _bridge_idx, _bridge_idx_lock),
+    )
     _thread_pool  = concurrent.futures.ThreadPoolExecutor(
         max_workers=SYNC_MAX_WORKERS, thread_name_prefix="sync-worker",
     )
@@ -1530,8 +1767,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("Interrupted — exiting.")
     finally:
-        if _sync_db_pool:
-            _sync_db_pool.closeall()
         if _process_pool:
             _process_pool.shutdown(wait=False)
         if _thread_pool:
