@@ -1,6 +1,15 @@
-asyncpg>=0.29.0
-python-dotenv>=1.0.0
-psycopg2-binary>=2.9.0
-grpcio>=1.66.0
-grpcio-status>=1.66.0
-cryptography>=42.0
+asyncpg~=0.29.0
+python-dotenv~=1.0.0
+psycopg2-binary~=2.9.0
+grpcio==1.66.0
+grpcio-status==1.66.0
+cryptography~=42.0
+
+# ── App data/file-processing libs (pre-installed, shared by all apps) ──
+numpy~=2.4.6
+pandas~=3.0.3        # DataFrames; uses numpy
+openpyxl~=3.1.5      # .xlsx read/write (pandas Excel engine)
+pypdf~=6.13.2        # PDF read / split / merge (pure-python)
+pdfplumber~=0.11.10  # PDF table / layout / text extraction (pulls pdfminer.six, Pillow)
+reportlab~=4.5.1     # PDF generation (pulls Pillow)
+# csv is in the Python stdlib — no dependency required

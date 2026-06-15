@@ -124,6 +124,10 @@ _registry_lock = threading.Lock()   # sync lock — held only during writes in _
 _import_lock = threading.Lock()      # serialises app module imports in the daemon process
 _exec_params: dict[int, set] = {}    # id(module) → execute() parameter names
 _app_versions: dict[str, str] = {}   # app_name → manifest version (sent in QueryRequest)
+# app_name → {action_name → ordered param names}, parsed from manifest.json's
+# "actions". Lets the named-query client reorder a dict of params into the
+# positional $1..$N list Core binds to the action's SQL (see _map_query_params).
+_app_query_params: dict[str, dict[str, list[str]]] = {}
 
 # ── Named Query Client (apps → Core over the tunnel) ──────────────────────────
 # QUERY_TIMEOUT bounds a single named-query round-trip. Set below the Core
@@ -456,10 +460,29 @@ def _resolve_node_id() -> str:
 _MAX_EXTRACT_FILE_BYTES  = 50 * 1024 * 1024   # 50 MB per-file cap
 _MAX_EXTRACT_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB aggregate cap
 
+# Pure frontend/static assets belong only in Go Core's static/apps cache (which
+# serves them at /apps/{name}/) — the runner executes main.py and never serves
+# these, so they are skipped on extract to keep the runner's app dir Python-only.
+# manifest.json (.json) is intentionally NOT here: the runner reads its version.
+_FRONTEND_ASSET_EXTS = frozenset({
+    ".html", ".htm", ".css", ".js", ".mjs", ".map", ".scss", ".less",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+})
+
+
+def _is_frontend_asset(member_name: str) -> bool:
+    """True for pure frontend assets that should not land in the runner's app dir."""
+    return os.path.splitext(member_name)[1].lower() in _FRONTEND_ASSET_EXTS
+
 
 def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> str:
     """
     Safely extract a ZIP bundle (raw bytes) into APPS_DIR/{app_name}/.
+
+    Pure frontend assets (see _is_frontend_asset) are skipped — they belong
+    only in Go Core's static/apps cache. The runner keeps Python source,
+    manifest.json, requirements.txt, and vendored libs/.
 
     Security enforcements applied on every ZIP entry:
     - Path traversal (zip-slip): normalised member path must stay inside the
@@ -499,6 +522,10 @@ def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> str:
 
                 if member.is_dir():
                     os.makedirs(dest, mode=0o755, exist_ok=True)
+                    continue
+
+                # Frontend assets live only on Go Core — the runner runs Python.
+                if _is_frontend_asset(member.filename):
                     continue
 
                 os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
@@ -741,16 +768,27 @@ def _load_app(app_name: str, app_path: str | None = None):
     # to scope named queries) without a reverse registry lookup.
     setattr(module, "__noderouter_app__", app_name)
 
-    # Read manifest version so it can be included in QueryRequest frames.
-    # Core uses the version to detect a stale cache entry and reload from DB.
+    # Read the manifest version (sent in QueryRequest so Core can detect a stale
+    # cache entry and reload from DB) and the per-action parameter order (used to
+    # reorder a named-param dict into the positional $1..$N list Core expects).
     version = ""
+    query_params: dict[str, list[str]] = {}
     manifest_path = os.path.join(os.path.dirname(app_path), "manifest.json")
     try:
         with open(manifest_path) as _mf:
-            version = json.load(_mf).get("version", "")
+            manifest = json.load(_mf)
+        version = manifest.get("version", "")
+        for action in manifest.get("actions", []) or []:
+            name = action.get("name")
+            if not name:
+                continue
+            query_params[name] = [
+                p.get("name") for p in (action.get("params") or []) if p.get("name")
+            ]
     except Exception:
         pass
     _app_versions[app_name] = version
+    _app_query_params[app_name] = query_params
 
     with _registry_lock:
         _app_registry[app_name] = module
@@ -938,6 +976,36 @@ class QueryError(Exception):
         self.status = status
 
 
+def _map_query_params(app_name: str, query_name: str, params):
+    """
+    Normalise an app's query params into the positional list Core binds to the
+    named SQL's $1..$N placeholders.
+
+    Apps call query("action", {...}) with a dict keyed by the parameter names
+    declared for that action in manifest.json, or query("action", [...]) with an
+    already-positional list. A dict is reordered to match the manifest's `params`
+    order (missing keys default to None); a list/tuple — or None — passes through
+    unchanged. A scalar is wrapped as a single-element list.
+
+    Raises QueryError(400) when a dict is supplied for an action that has no
+    parameter schema in the manifest, since the bind order is then unknown.
+    """
+    if params is None:
+        return []
+    if isinstance(params, dict):
+        order = _app_query_params.get(app_name, {}).get(query_name)
+        if order is None:
+            raise QueryError(
+                400,
+                f"query '{query_name}' has no parameter schema in manifest.json "
+                f"for app '{app_name}' — pass params as a positional list",
+            )
+        return [params.get(n) for n in order]
+    if isinstance(params, (list, tuple)):
+        return list(params)
+    return [params]
+
+
 async def _send_query(query_name: str, params, app_name: str):
     """
     Send a registered named-query request to Core over the tunnel and await the
@@ -948,6 +1016,10 @@ async def _send_query(query_name: str, params, app_name: str):
     if outq is None or _event_loop is None:
         raise QueryError(503, "tunnel not connected")
 
+    # Reorder a named-param dict into Core's positional $1..$N list (no-op for a
+    # list/None); raises QueryError before a qid is allocated on a bad dict.
+    positional = _map_query_params(app_name, query_name, params)
+
     qid = uuid.uuid4().hex
     fut: asyncio.Future = _event_loop.create_future()
     _query_pending[qid] = fut
@@ -956,7 +1028,7 @@ async def _send_query(query_name: str, params, app_name: str):
             query_request=tunnel_pb2.QueryRequest(
                 qid=qid,
                 query_name=query_name,
-                params=json.dumps(params if params is not None else []).encode(),
+                params=json.dumps(positional).encode(),
                 app_name=app_name or "",
                 app_version=_app_versions.get(app_name, "") if app_name else "",
             ),
@@ -1262,7 +1334,7 @@ async def _dispatch_execute(module, payload: dict):
     Sync apps continue to run in the ThreadPoolExecutor as before.
     """
     fn = getattr(module, "execute")
-    if asyncio.iscoroutinefunction(fn):
+    if inspect.iscoroutinefunction(fn):
         params = _exec_params.get(id(module)) or set(inspect.signature(fn).parameters)
         app_name = getattr(module, "__noderouter_app__", "")
         kwargs = {}
@@ -1594,14 +1666,54 @@ async def _pull_and_reload_app(app_name: str) -> None:
         )
 
 
+async def _purge_local_app(app_name: str) -> None:
+    """
+    Drop an app from this runner entirely in response to NOTIFY app_deleted.
+
+    Evicts the app from the in-memory registry (so the sync path stops serving
+    it) and removes its on-disk files — the active path (symlink or directory)
+    plus every staged version under .versions/. Mirrors the cache purge Go Core
+    performs when an app is deleted from the admin app-management screen.
+
+    In-flight executions keep their own live module reference, so a delete that
+    races a request does not break the request already running.
+    """
+    if err := _validate_app_name(app_name):
+        log.warning("[DELETE] app_deleted ignored for '%s': %s", app_name, err)
+        return
+
+    with _registry_lock:
+        module = _app_registry.pop(app_name, None)
+    if module is not None:
+        _exec_params.pop(id(module), None)
+    _app_versions.pop(app_name, None)
+    _app_query_params.pop(app_name, None)
+    _purge_app_modules(app_name)
+
+    # Remove on-disk files. app_name is regex-validated above (no separators or
+    # "..") so these joins cannot escape APPS_DIR.
+    abs_apps_dir = os.path.realpath(APPS_DIR)
+    active_path = os.path.join(abs_apps_dir, app_name)
+    try:
+        if os.path.islink(active_path) or os.path.isfile(active_path):
+            os.unlink(active_path)
+        elif os.path.isdir(active_path):
+            shutil.rmtree(active_path, ignore_errors=True)
+    except OSError as exc:
+        log.warning("[DELETE] Could not remove active path for '%s': %s", app_name, exc)
+    shutil.rmtree(os.path.join(abs_apps_dir, ".versions", app_name), ignore_errors=True)
+
+    log.info("[DELETE] Purged app '%s' from runner registry and disk", app_name)
+
+
 # ── PostgreSQL LISTEN Daemon (asyncpg) ─────────────────────────────────────────
 async def _async_listener_loop() -> None:
     """
     Persistent PostgreSQL LISTEN daemon via asyncpg.
-    Listens on new_job (trigger async job dispatch) and app_updated (hot-reload).
-    Reconnects automatically with exponential backoff.
+    Listens on new_job (async job dispatch), app_updated (hot-reload), and
+    app_deleted (local purge). Reconnects automatically with exponential backoff.
     """
-    log.info("Async listener started — LISTEN new_job + app_updated (node_id: %s)", NODE_ID)
+    log.info("Async listener started — LISTEN new_job + app_updated + app_deleted (node_id: %s)", NODE_ID)
     attempt = 0
 
     async def _on_new_job(conn, pid, channel, payload):
@@ -1630,12 +1742,20 @@ async def _async_listener_loop() -> None:
         log.info("[DEPLOY] NOTIFY app_updated: pulling '%s' from PostgreSQL blob store", name)
         asyncio.create_task(_pull_and_reload_app(name))
 
+    async def _on_app_deleted(conn, pid, channel, payload):
+        name = (payload or "").strip()
+        if not name:
+            return
+        log.info("[DELETE] NOTIFY app_deleted: purging '%s' from this runner", name)
+        asyncio.create_task(_purge_local_app(name))
+
     while not _shutdown_event.is_set():
         conn = None
         try:
             conn = await asyncpg.connect(DATABASE_URL)
             await conn.add_listener("new_job",     _on_new_job)
             await conn.add_listener("app_updated", _on_app_updated)
+            await conn.add_listener("app_deleted", _on_app_deleted)
             log.info("Async listener: LISTEN channels registered")
             attempt = 0
             # Park until shutdown or connection drop.
