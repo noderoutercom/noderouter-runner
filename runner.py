@@ -1443,9 +1443,9 @@ async def _handle_req(send, req: tunnel_pb2.Request) -> None:
                         payload=json.dumps(act_payload).encode(),
                     ),
                 ))
-                log.debug("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
+                log.info("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
             except Exception as exc:
-                log.debug(
+                log.warning(
                     "[action] Frame send failed app=%s action=%s: %s",
                     app_name, act.get("name"), exc,
                 )
